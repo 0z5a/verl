@@ -100,6 +100,42 @@ deadline slack. A `keep_baseline` or `insufficient_evidence`
 decision is a valid result and must not be converted into a phase shift by the
 caller.
 
+## Topology policy cells
+
+Every recommendation also contains a content-addressed `topology_cell_id` and
+its canonical `topology_fingerprint`. The fingerprint includes:
+
+- single-node or multi-node scope;
+- local PCIe, NVLink, or unknown fabric;
+- world size and the exact rank-to-node placement, without embedding ephemeral
+  hostnames;
+- accelerator model by rank;
+- an optional opaque topology inventory signature.
+
+Single-node PCIe, single-node NVLink, and multi-node measurements therefore
+land in separate cells. Multi-node evidence must include a consistent
+`topology_signature`; node count alone is not sufficient to identify a cluster
+topology. Runs with missing ranks, partially missing node identities, or a
+declared class that disagrees with observed host placement are rejected.
+
+Use the selector before applying a stored policy to a new run:
+
+```bash
+python scripts/communication_topology_policy.py \
+  --policy-json phase-policy.json \
+  --target-trace-jsonl current-run/rank-*.jsonl \
+  --output-json compatible-policy.json
+```
+
+Selection is exact: every fingerprint field must match. There is no nearest
+topology, model-family fallback, or cross-topology extrapolation. If no cell
+matches, the command exits unsuccessfully and the workload must collect a new
+baseline and candidate traces for its own cell.
+
+NIC traffic classes, rail assignment, and route selection are outside this
+policy layer. `topology_signature` is only an opaque compatibility identity; it
+does not configure or infer any NIC behavior.
+
 An aggregate phase-sweep summary may record isolated/contended latency and
 GPU-realized offsets, but it has no consumer timestamp. Feed semantic trace
 records to this tool; do not infer consumer slack from aggregate collective

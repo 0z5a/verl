@@ -238,7 +238,10 @@ def test_incomplete_four_rank_trial_is_rejected():
 def test_declared_world_size_detects_an_entire_missing_rank_shard():
     records = [record for record in _trace_fixture(4) if not (record["run_id"] == "safe-shift" and record["rank"] == 3)]
 
-    with pytest.raises(TraceFormatError, match=r"run 'safe-shift' has ranks \(0, 1, 2\), expected \(0, 1, 2, 3\)"):
+    with pytest.raises(
+        TraceFormatError,
+        match=r"run 'safe-shift': trace ranks \(0, 1, 2\) do not cover world_size 4",
+    ):
         tune_traces(records, "comm_a", "comm_b")
 
 

@@ -34,6 +34,21 @@ from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+if __package__:
+    from scripts.communication_topology_policy import (
+        TopologyEvidenceError,
+        TopologyFingerprint,
+        fingerprint_trace_runs,
+        topology_run_key,
+    )
+else:
+    from communication_topology_policy import (
+        TopologyEvidenceError,
+        TopologyFingerprint,
+        fingerprint_trace_runs,
+        topology_run_key,
+    )
+
 SCHEMA_VERSION = 2
 DEFAULT_PAIR_FIELDS = (
     "step",
@@ -66,6 +81,8 @@ class RankPair:
     timestamp_domain: str
     gpu_timestamp_semantics: str
     clock_sync_error_bound_us: float
+    topology_cell_id: str
+    topology_fingerprint_json: str
     operation_a: str
     operation_b: str
     message_bytes_a: int
@@ -95,6 +112,8 @@ class RankPair:
             self.topology_class,
             self.timestamp_domain,
             self.gpu_timestamp_semantics,
+            self.topology_cell_id,
+            self.topology_fingerprint_json,
             self.operation_a,
             self.operation_b,
             self.message_bytes_a,
@@ -299,6 +318,7 @@ def _pair_records(
     ordinal: int,
     operation_a: str,
     operation_b: str,
+    topology: TopologyFingerprint,
 ) -> RankPair:
     a_start, a_end = _validate_timestamps(record_a)
     b_start, b_end = _validate_timestamps(record_b)
@@ -397,10 +417,12 @@ def _pair_records(
         rank=rank,
         declared_world_size=declared_world_size,
         framework=framework,
-        topology_class=topology_class,
+        topology_class=topology.topology_class,
         timestamp_domain=timestamp_domain,
         gpu_timestamp_semantics=gpu_timestamp_semantics,
         clock_sync_error_bound_us=float(clock_sync_error_bound_us),
+        topology_cell_id=topology.cell_id,
+        topology_fingerprint_json=topology.canonical_json,
         operation_a=operation_a,
         operation_b=operation_b,
         message_bytes_a=message_bytes_a,
@@ -431,6 +453,11 @@ def pair_trace_records(
 ) -> list[RankPair]:
     """Pair A/B trace records by run, rank, semantic context, and launch order."""
 
+    records = list(records)
+    try:
+        topology_by_run = fingerprint_trace_runs(records, (operation_a, operation_b))
+    except TopologyEvidenceError as exc:
+        raise TraceFormatError(str(exc)) from exc
     grouped: defaultdict[tuple[Any, ...], dict[str, list[Mapping[str, Any]]]] = defaultdict(
         lambda: {operation_a: [], operation_b: []}
     )
@@ -475,6 +502,7 @@ def pair_trace_records(
                     ordinal=ordinal,
                     operation_a=operation_a,
                     operation_b=operation_b,
+                    topology=topology_by_run[topology_run_key(record_a)],
                 )
             )
     return pairs
@@ -676,6 +704,8 @@ def _workload_dict(workload: tuple[Any, ...]) -> dict[str, Any]:
         topology_class,
         timestamp_domain,
         gpu_timestamp_semantics,
+        topology_cell_id,
+        topology_fingerprint_json,
         operation_a,
         operation_b,
         message_bytes_a,
@@ -689,6 +719,8 @@ def _workload_dict(workload: tuple[Any, ...]) -> dict[str, Any]:
         "topology_class": topology_class,
         "timestamp_domain": timestamp_domain,
         "gpu_timestamp_semantics": gpu_timestamp_semantics,
+        "topology_cell_id": topology_cell_id,
+        "topology_fingerprint": json.loads(topology_fingerprint_json),
         "operation_a": operation_a,
         "operation_b": operation_b,
         "message_bytes_a": message_bytes_a,
