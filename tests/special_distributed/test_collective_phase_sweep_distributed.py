@@ -63,8 +63,12 @@ def test_collective_phase_sweep_two_rank_smoke(tmp_path: Path):
     subprocess.run(command, cwd=repository_root, check=True, timeout=120)
 
     payload = json.loads(output.read_text())
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
     assert payload["world_size"] == 2
+    assert payload["timestamp_domain"] == "single-node-perf-counter"
+    assert payload["gpu_timestamp_semantics"] == "event-bracket"
+    assert payload["kernel_observed"] is False
+    assert payload["timing_sources"]["realized_gpu_offset"] == "host_call_bracket_start"
     assert payload["sequence_validation"]["all_groups_consistent"]
     assert {result["policy"] for result in payload["results"]} == {
         "isolated",

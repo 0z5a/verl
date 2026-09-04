@@ -24,7 +24,9 @@ four-GPU run is::
 
 ``offset`` uses an absolute host clock gate. It is a measurement/search tool,
 not a recommendation to add a fixed sleep to a training runtime. On CUDA the
-reported realized offset and operation durations come from CUDA events.
+reported realized offset and operation durations are CUDA-event brackets around
+collective eligibility and observed completion. They are not exact NCCL kernel
+boundaries; use an Nsight Systems/CUPTI trace for kernel-observed evidence.
 """
 
 from __future__ import annotations
@@ -51,7 +53,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 COMM_A_CHOICES = ("all_to_all", "ulysses_all_to_all")
 COMM_B_CHOICES = ("all_reduce", "reduce_scatter", "all_gather")
 POLICY_CHOICES = ("isolated", "concurrent", "serialized", "offset")
@@ -669,6 +671,18 @@ def _describe_topology(device: torch.device, rank: int, world_size: int) -> dict
     return {"topology_class": topology_class, "ranks": gathered, "nvidia_smi_topology": topo_matrix}
 
 
+def _require_single_node(topology: dict[str, Any] | None, rank: int) -> None:
+    """Reject a clock domain that cannot support the benchmark's absolute gate."""
+
+    supported = [topology["topology_class"] != "multi-node" if rank == 0 else None]
+    dist.broadcast_object_list(supported, src=0)
+    if not supported[0]:
+        raise RuntimeError(
+            "collective phase sweep currently requires one node because rank-0 "
+            "perf_counter_ns anchors are not portable across host clock domains"
+        )
+
+
 def _record_for_policy(
     policy: str,
     offset_us: float | None,
@@ -708,7 +722,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--group-layout",
         default="auto",
-        help="auto, mesh, world, or an epN-dpM shorthand such as ep3-dp2",
+        help="auto, mesh, world, or an epN-dpM shorthand such as ep2-dp2",
     )
     parser.add_argument(
         "--mesh-shape",
@@ -800,6 +814,7 @@ def main(argv: list[str] | None = None) -> int:
         buffer_b = CollectiveBuffer(args.comm_b, args.message_bytes_b, dtype, device, groups.group_b)
         runner = BenchmarkRunner(buffer_a, buffer_b, device, args.validate, args.launch_anchor_lead_us)
         topology = _describe_topology(device, rank, world_size)
+        _require_single_node(topology, rank)
 
         if rank == 0:
             print("Measuring isolated A baseline...", file=sys.stderr, flush=True)
@@ -903,10 +918,23 @@ def main(argv: list[str] | None = None) -> int:
                 "seed": args.seed,
                 "launch_anchor_lead_us": args.launch_anchor_lead_us,
                 "offset_execution_order_us": offsets if "offset" in args.policies else [],
+                "timestamp_domain": (
+                    "single-node-perf-counter-projected-cuda-event"
+                    if device.type == "cuda"
+                    else "single-node-perf-counter"
+                ),
+                "gpu_timestamp_semantics": "event-bracket",
+                "kernel_observed": False,
                 "timing_sources": {
                     "api_launch_offset": "host_perf_counter",
-                    "realized_gpu_offset": "cuda_events" if device.type == "cuda" else "host_perf_counter",
-                    "rank_skew": "host_anchored_cuda_events" if device.type == "cuda" else "host_perf_counter",
+                    "realized_gpu_offset": (
+                        "cuda_event_bracket_start" if device.type == "cuda" else "host_call_bracket_start"
+                    ),
+                    "rank_skew": (
+                        "single_node_host_anchored_cuda_event_bracket"
+                        if device.type == "cuda"
+                        else "single_node_host_perf_counter"
+                    ),
                 },
                 "topology": topology,
                 "sequence_validation": {
