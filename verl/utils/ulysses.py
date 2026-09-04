@@ -187,6 +187,8 @@ def launch_all_to_all_tensor(
         sequence_id=next_collective_sequence_id(group, process_group_id),
         launch_event=launch_event,
         complete_event=complete_event,
+        consumer_device=local_input.device,
+        owned_resources=(local_input, *input_list, *output_list),
     )
 
 
@@ -226,6 +228,8 @@ def launch_all_gather_tensor(
         sequence_id=next_collective_sequence_id(group, process_group_id),
         launch_event=launch_event,
         complete_event=complete_event,
+        consumer_device=local_tensor.device,
+        owned_resources=(local_tensor, output),
     )
 
 

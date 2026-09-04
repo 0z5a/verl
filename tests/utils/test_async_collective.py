@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import importlib.util
 import sys
 import types
+import weakref
 from pathlib import Path
 
 import pytest
@@ -131,6 +133,101 @@ def test_handle_rejects_invalid_completion_event():
     )
     with pytest.raises(TypeError, match=r"record\(\)"):
         handle.wait_collective()
+    assert handle.work.wait_count == 0
+
+
+def test_handle_caches_finalizer_error_without_repeating_side_effects():
+    calls = 0
+    error = RuntimeError("layout failed")
+
+    def fail_finalize():
+        nonlocal calls
+        calls += 1
+        raise error
+
+    work = _FakeWork()
+    handle = collective.AsyncCollectiveHandle(
+        work=work,
+        finalize=fail_finalize,
+        comm_kind="all_gather",
+        process_group_id="sp-group-0",
+        sequence_id=0,
+    )
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="layout failed") as raised:
+            handle.wait()
+        assert raised.value is error
+    assert work.wait_count == 1
+    assert calls == 1
+    assert handle.finalization_attempted
+    assert not handle.finalized
+    assert handle.finalization_error is error
+
+
+def test_handle_rejects_a_second_cuda_consumer_stream(monkeypatch):
+    current_stream = [(0, 11)]
+    monkeypatch.setattr(collective, "_accelerator_stream_key", lambda _device: current_stream[0])
+    finalize_calls = 0
+
+    def finalize():
+        nonlocal finalize_calls
+        finalize_calls += 1
+        return object()
+
+    handle = collective.AsyncCollectiveHandle(
+        work=_FakeWork(),
+        finalize=finalize,
+        comm_kind="all_reduce",
+        process_group_id="dp-group-0",
+        sequence_id=0,
+        consumer_device=torch.device("cuda", 0),
+    )
+
+    handle.wait_collective()
+    current_stream[0] = (0, 12)
+    with pytest.raises(RuntimeError, match="one CUDA consumer stream"):
+        handle.finalize_result()
+    assert finalize_calls == 0
+
+    current_stream[0] = (0, 11)
+    result = handle.finalize_result()
+    assert handle.wait() is result
+    assert finalize_calls == 1
+
+
+def test_handle_keeps_owned_resources_alive():
+    class Resource:
+        pass
+
+    resource = Resource()
+    reference = weakref.ref(resource)
+    handle = collective.AsyncCollectiveHandle(
+        work=_FakeWork(),
+        finalize=lambda: None,
+        comm_kind="all_reduce",
+        process_group_id="dp-group-0",
+        sequence_id=0,
+        owned_resources=(resource,),
+    )
+    del resource
+    gc.collect()
+    assert reference() is not None
+    del handle
+    gc.collect()
+    assert reference() is None
+
+
+def test_handle_requires_immutable_owned_resource_container():
+    with pytest.raises(TypeError, match="immutable tuple"):
+        collective.AsyncCollectiveHandle(
+            work=_FakeWork(),
+            finalize=lambda: None,
+            comm_kind="all_reduce",
+            process_group_id="dp-group-0",
+            sequence_id=0,
+            owned_resources=[],
+        )
 
 
 def test_sequence_ids_are_monotonic_per_process_group():
@@ -183,6 +280,8 @@ def test_ulysses_async_all_to_all_returns_structured_handle(monkeypatch):
     assert isinstance(handle, collective.AsyncCollectiveHandle)
     assert handle.comm_kind == "ulysses_all_to_all"
     assert handle.process_group_id == "sp-group-0"
+    assert handle.consumer_device == tensor.device
+    assert len(handle.owned_resources) == 5
     assert torch.equal(handle.wait(), tensor)
     assert works[0].wait_count == 1
     assert order == ["launch_event", "collective_launch", "work_complete", "complete_event"]
@@ -191,6 +290,36 @@ def test_ulysses_async_all_to_all_returns_structured_handle(monkeypatch):
     assert callable(legacy_wait)
     assert torch.equal(legacy_wait(), tensor)
     assert works[1].wait_count == 1
+
+
+def test_ulysses_legacy_async_closure_preserves_wait_errors(monkeypatch):
+    ulysses = _load_ulysses_module(monkeypatch)
+    group = _FakeGroup()
+    error = RuntimeError("collective failed")
+
+    def fail_wait():
+        raise error
+
+    work = _FakeWork(fail_wait)
+    monkeypatch.setattr(ulysses.dist, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(
+        ulysses.dist,
+        "all_to_all",
+        lambda output_list, input_list, *, group, async_op: work,
+    )
+
+    legacy_wait = ulysses.all_to_all_tensor(
+        torch.arange(8, dtype=torch.float32).reshape(2, 4),
+        scatter_dim=0,
+        gather_dim=0,
+        group=group,
+        async_op=True,
+    )
+    assert callable(legacy_wait)
+    with pytest.raises(RuntimeError, match="collective failed") as raised:
+        legacy_wait()
+    assert raised.value is error
+    assert work.wait_count == 1
 
 
 def test_ulysses_async_all_gather_returns_structured_handle(monkeypatch):
@@ -213,4 +342,7 @@ def test_ulysses_async_all_gather_returns_structured_handle(monkeypatch):
 
     assert handle.comm_kind == "ulysses_all_gather"
     assert handle.process_group_id == "sp-group-0"
+    assert handle.consumer_device == tensor.device
+    assert len(handle.owned_resources) == 2
+    assert handle.owned_resources[0] is tensor
     assert torch.equal(handle.wait(), torch.cat((tensor, tensor)))

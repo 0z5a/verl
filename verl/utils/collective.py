@@ -20,6 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Generic, Protocol, TypeVar, cast
 
+import torch
 import torch.distributed as dist
 
 T = TypeVar("T")
@@ -32,6 +33,30 @@ class CollectiveWork(Protocol):
     """Minimum interface implemented by ``torch.distributed.Work``."""
 
     def wait(self) -> object: ...
+
+
+def _accelerator_stream_key(device: torch.device) -> tuple[int, int]:
+    """Return the current accelerator stream identity for a concrete device."""
+
+    from verl.utils.device import get_device_id, get_device_name, get_torch_device, is_device_available
+
+    if not is_device_available():
+        raise RuntimeError("an accelerator consumer device requires an available device runtime")
+    if device.type != get_device_name():
+        raise RuntimeError(f"unsupported consumer device type: {device.type}")
+    device_index = device.index
+    if device_index is None:
+        device_index = get_device_id()
+    current_stream = getattr(get_torch_device(), "current_stream", None)
+    if not callable(current_stream):
+        raise RuntimeError("the accelerator runtime does not expose current_stream()")
+    stream = current_stream(device_index)
+    stream_id = getattr(stream, "stream_id", None)
+    if stream_id is None:
+        stream_id = getattr(stream, f"{get_device_name()}_stream", None)
+    if stream_id is None:
+        raise RuntimeError("the accelerator stream does not expose a stable identity")
+    return device_index, int(stream_id)
 
 
 def resolve_process_group_id(group: dist.ProcessGroup | None = None) -> str:
@@ -68,11 +93,19 @@ def next_collective_sequence_id(group: dist.ProcessGroup | None = None, process_
 class AsyncCollectiveHandle(Generic[T]):
     """Own an async collective and its post-communication transformation.
 
-    ``wait_collective`` waits for transport completion and records
-    ``complete_event`` before any concat/reshape finalizer runs. Callers that
-    need separate measurements can invoke ``wait_collective`` and
-    ``finalize_result`` independently; ``wait`` provides the usual combined
-    behavior. All three methods are idempotent.
+    ``wait_collective`` calls ``Work.wait`` and records ``complete_event``
+    before any concat/reshape finalizer runs. For CUDA work, this establishes
+    ordering on one consumer stream; it does not claim CPU-visible physical
+    kernel completion. The first wait binds the handle to the current stream
+    of ``consumer_device``. Later waits from a different CUDA stream fail
+    loudly instead of silently omitting that stream's dependency.
+
+    Callers that need separate measurements can invoke ``wait_collective`` and
+    ``finalize_result`` independently on that same stream; ``wait`` provides
+    the usual combined behavior. The collective wait and finalizer each run at
+    most once. A finalizer exception is cached and re-raised without repeating
+    its side effects. ``owned_resources`` keeps asynchronous input, output,
+    and staging objects alive for at least the handle lifetime.
     """
 
     work: CollectiveWork
@@ -82,9 +115,20 @@ class AsyncCollectiveHandle(Generic[T]):
     sequence_id: int
     launch_event: Any | None = None
     complete_event: Any | None = None
+    consumer_device: torch.device | str | None = None
+    owned_resources: tuple[Any, ...] = ()
     _collective_complete: bool = field(default=False, init=False, repr=False)
     _result: object = field(default=_UNSET, init=False, repr=False)
+    _finalization_attempted: bool = field(default=False, init=False, repr=False)
+    _finalization_error: BaseException | None = field(default=None, init=False, repr=False)
+    _consumer_stream_key: tuple[int, int] | None = field(default=None, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.consumer_device is not None:
+            self.consumer_device = torch.device(self.consumer_device)
+        if type(self.owned_resources) is not tuple:
+            raise TypeError("owned_resources must be an immutable tuple")
 
     @property
     def collective_complete(self) -> bool:
@@ -94,17 +138,41 @@ class AsyncCollectiveHandle(Generic[T]):
     def finalized(self) -> bool:
         return self._result is not _UNSET
 
+    @property
+    def finalization_attempted(self) -> bool:
+        return self._finalization_attempted
+
+    @property
+    def finalization_error(self) -> BaseException | None:
+        return self._finalization_error
+
+    def _bind_consumer_stream(self) -> None:
+        device = self.consumer_device
+        if device is None or device.type == "cpu":
+            return
+        stream_key = _accelerator_stream_key(device)
+        if self._consumer_stream_key is None:
+            self._consumer_stream_key = stream_key
+        elif self._consumer_stream_key != stream_key:
+            raise RuntimeError(
+                "AsyncCollectiveHandle supports one CUDA consumer stream; "
+                "wait and finalize on the stream that performed the first wait"
+            )
+
     def wait_collective(self) -> None:
-        """Wait once for the collective and mark its completion event."""
+        """Establish collective completion ordering on the bound stream once."""
 
         with self._lock:
+            self._bind_consumer_stream()
             if self._collective_complete:
                 return
-            self.work.wait()
+            record = None
             if self.complete_event is not None:
                 record = getattr(self.complete_event, "record", None)
                 if not callable(record):
                     raise TypeError("complete_event must provide a callable record() method")
+            self.work.wait()
+            if record is not None:
                 record()
             self._collective_complete = True
 
@@ -113,8 +181,18 @@ class AsyncCollectiveHandle(Generic[T]):
 
         self.wait_collective()
         with self._lock:
+            if self._finalization_attempted:
+                if self._finalization_error is not None:
+                    raise self._finalization_error
+            else:
+                self._finalization_attempted = True
+                try:
+                    self._result = self.finalize()
+                except BaseException as exc:
+                    self._finalization_error = exc
+                    raise
             if self._result is _UNSET:
-                self._result = self.finalize()
+                raise RuntimeError("collective finalizer did not produce a result")
             return cast(T, self._result)
 
     def wait(self) -> T:
