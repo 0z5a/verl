@@ -67,6 +67,7 @@ def _candidate_records(
                     {
                         **common,
                         "operation": "comm_a",
+                        "process_group_id": "group-a",
                         "message_bytes": 8192,
                         "communicator_sequence_id": trial,
                         "gpu_start_timestamp_ns": a_start_ns,
@@ -76,6 +77,7 @@ def _candidate_records(
                     {
                         **common,
                         "operation": "comm_b",
+                        "process_group_id": "group-b",
                         "message_bytes": 4096,
                         "communicator_sequence_id": trial,
                         "gpu_start_timestamp_ns": b_start_ns,
@@ -438,4 +440,34 @@ def test_timing_provenance_is_required_on_both_pair_members():
     del record["gpu_timestamp_semantics"]
 
     with pytest.raises(TraceFormatError, match="must be present on both paired records"):
+        tune_traces(records, "comm_a", "comm_b")
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ("world_size", "world_size"),
+        ("process_group_id", "process_group_id must be a non-empty string"),
+        ("communicator_sequence_id", "communicator_sequence_id must be a finite number"),
+        ("completion_observed", "completion_observed=true is required"),
+    ],
+)
+def test_required_safety_evidence_cannot_be_omitted(field, message):
+    records = deepcopy(_trace_fixture(2))
+    record = next(item for item in records if item["operation"] == "comm_b")
+    if field == "completion_observed":
+        del record["metadata"][field]
+    else:
+        del record[field]
+
+    with pytest.raises(TraceFormatError, match=message):
+        tune_traces(records, "comm_a", "comm_b")
+
+
+def test_optional_pair_evidence_cannot_be_present_on_only_one_member():
+    records = deepcopy(_trace_fixture(2))
+    record = next(item for item in records if item["operation"] == "comm_b")
+    del record["requested_offset_us"]
+
+    with pytest.raises(TraceFormatError, match="present on both paired records or neither"):
         tune_traces(records, "comm_a", "comm_b")

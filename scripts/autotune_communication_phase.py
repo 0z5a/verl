@@ -234,15 +234,6 @@ def _integer(record: Mapping[str, Any], name: str) -> int:
     return int(value)
 
 
-def _optional_integer(record: Mapping[str, Any], name: str) -> int | None:
-    value = _number(record, name, required=False)
-    if value is None:
-        return None
-    if not value.is_integer():
-        raise TraceFormatError(f"{name} must be an integer or null")
-    return int(value)
-
-
 def _string(record: Mapping[str, Any], name: str, *, default: str | None = None) -> str:
     value = _record_value(record, name)
     if value is None and default is not None:
@@ -282,14 +273,21 @@ def _required_common_value(records: Sequence[Mapping[str, Any]], name: str) -> A
     return _common_value(records, name)
 
 
+def _optional_common_value(records: Sequence[Mapping[str, Any]], name: str) -> Any:
+    values = [_record_value(record, name) for record in records]
+    if any(value is None for value in values) and not all(value is None for value in values):
+        raise TraceFormatError(f"{name} must be present on both paired records or neither")
+    return _common_value(records, name)
+
+
 def _validate_timestamps(record: Mapping[str, Any]) -> tuple[int, int]:
     start = _integer(record, "gpu_start_timestamp_ns")
     end = _integer(record, "gpu_end_timestamp_ns")
     if end < start:
         raise TraceFormatError("gpu_end_timestamp_ns precedes gpu_start_timestamp_ns")
     completion_observed = _record_value(record, "completion_observed")
-    if completion_observed is False:
-        raise TraceFormatError("trace contains an operation without observed completion")
+    if completion_observed is not True:
+        raise TraceFormatError("completion_observed=true is required for every operation")
     return start, end
 
 
@@ -313,25 +311,24 @@ def _pair_records(
         raise TraceFormatError("paired records disagree on rank")
     if rank < 0:
         raise TraceFormatError("rank must be non-negative")
-    declared_world_size = _common_value((record_a, record_b), "world_size")
-    if declared_world_size is not None:
-        if (
-            isinstance(declared_world_size, bool)
-            or not isinstance(declared_world_size, int | float)
-            or not float(declared_world_size).is_integer()
-            or declared_world_size < 2
-        ):
-            raise TraceFormatError("world_size must be an integer of at least two")
-        declared_world_size = int(declared_world_size)
-        if rank >= declared_world_size:
-            raise TraceFormatError("rank must be smaller than world_size")
+    declared_world_size = _required_common_value((record_a, record_b), "world_size")
+    if (
+        isinstance(declared_world_size, bool)
+        or not isinstance(declared_world_size, int | float)
+        or not float(declared_world_size).is_integer()
+        or declared_world_size < 2
+    ):
+        raise TraceFormatError("world_size must be an integer of at least two")
+    declared_world_size = int(declared_world_size)
+    if rank >= declared_world_size:
+        raise TraceFormatError("rank must be smaller than world_size")
 
-    framework = _common_value((record_a, record_b), "framework")
+    framework = _required_common_value((record_a, record_b), "framework")
     if not isinstance(framework, str) or not framework:
         raise TraceFormatError("framework must be a non-empty string")
-    topology_class = _common_value((record_a, record_b), "topology_class") or "unknown"
-    if not isinstance(topology_class, str):
-        raise TraceFormatError("topology_class must be a string")
+    topology_class = _required_common_value((record_a, record_b), "topology_class")
+    if not isinstance(topology_class, str) or not topology_class:
+        raise TraceFormatError("topology_class must be a non-empty string")
     timestamp_domain = _required_common_value((record_a, record_b), "timestamp_domain")
     if not isinstance(timestamp_domain, str) or not timestamp_domain:
         raise TraceFormatError("timestamp_domain must be a non-empty string")
@@ -351,14 +348,14 @@ def _pair_records(
     if message_bytes_a <= 0 or message_bytes_b <= 0:
         raise TraceFormatError("message_bytes must be positive")
 
-    requested_offset = _common_value((record_a, record_b), "requested_offset_us")
+    requested_offset = _optional_common_value((record_a, record_b), "requested_offset_us")
     if requested_offset is not None:
         if isinstance(requested_offset, bool) or not isinstance(requested_offset, int | float):
             raise TraceFormatError("requested_offset_us must be numeric or null")
         requested_offset = float(requested_offset)
         if not math.isfinite(requested_offset):
             raise TraceFormatError("requested_offset_us must be finite")
-    policy = _common_value((record_a, record_b), "policy")
+    policy = _optional_common_value((record_a, record_b), "policy")
     if policy is None:
         if requested_offset == 0:
             policy = "eager"
@@ -369,7 +366,7 @@ def _pair_records(
     if not isinstance(policy, str) or not policy:
         raise TraceFormatError("policy must be a non-empty string")
 
-    critical_path_duration_us = _common_value((record_a, record_b), "critical_path_duration_us")
+    critical_path_duration_us = _optional_common_value((record_a, record_b), "critical_path_duration_us")
     if critical_path_duration_us is not None:
         if (
             isinstance(critical_path_duration_us, bool)
@@ -386,6 +383,13 @@ def _pair_records(
         if explicit is False:
             sequence_consistent = False
 
+    process_group_id_a = _string(record_a, "process_group_id")
+    process_group_id_b = _string(record_b, "process_group_id")
+    sequence_id_a = _integer(record_a, "communicator_sequence_id")
+    sequence_id_b = _integer(record_b, "communicator_sequence_id")
+    if sequence_id_a < 0 or sequence_id_b < 0:
+        raise TraceFormatError("communicator_sequence_id must be non-negative")
+
     return RankPair(
         run_id=run_id,
         context=context,
@@ -401,12 +405,12 @@ def _pair_records(
         operation_b=operation_b,
         message_bytes_a=message_bytes_a,
         message_bytes_b=message_bytes_b,
-        transport_a=_string(record_a, "transport", default="unknown"),
-        transport_b=_string(record_b, "transport", default="unknown"),
-        process_group_id_a=_string(record_a, "process_group_id", default="unknown-a"),
-        process_group_id_b=_string(record_b, "process_group_id", default="unknown-b"),
-        sequence_id_a=_optional_integer(record_a, "communicator_sequence_id"),
-        sequence_id_b=_optional_integer(record_b, "communicator_sequence_id"),
+        transport_a=_string(record_a, "transport"),
+        transport_b=_string(record_b, "transport"),
+        process_group_id_a=process_group_id_a,
+        process_group_id_b=process_group_id_b,
+        sequence_id_a=sequence_id_a,
+        sequence_id_b=sequence_id_b,
         policy=policy,
         requested_offset_us=requested_offset,
         a_start_ns=a_start,
@@ -440,7 +444,16 @@ def pair_trace_records(
         rank = _integer(record, "rank")
         context = _context(record, pair_fields)
         declared_world_size = _record_value(record, "world_size")
-        grouped[(run_id, rank, declared_world_size, context)][operation].append(record)
+        if declared_world_size is None:
+            raise TraceFormatError("world_size must be present on every selected record")
+        if (
+            isinstance(declared_world_size, bool)
+            or not isinstance(declared_world_size, int | float)
+            or not float(declared_world_size).is_integer()
+            or declared_world_size < 2
+        ):
+            raise TraceFormatError("world_size must be an integer of at least two")
+        grouped[(run_id, rank, int(declared_world_size), context)][operation].append(record)
     if not selected:
         raise TraceFormatError(f"no records matched operations {operation_a!r} and {operation_b!r}")
 

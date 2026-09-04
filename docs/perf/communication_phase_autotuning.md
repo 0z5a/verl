@@ -16,8 +16,8 @@ Pass every rank shard from every candidate run. Each JSONL record must contain:
 
 - `framework`, `run_id`, `rank`, `operation`, `message_bytes`, `transport`, and
   `topology_class`;
-- `world_size` when available, so an accidentally omitted highest-rank shard is
-  detected directly;
+- `world_size`, so an accidentally omitted highest-rank shard is detected
+  directly;
 - `gpu_start_timestamp_ns` and `gpu_end_timestamp_ns` from a common monotonic
   time domain across ranks;
 - `gpu_timestamp_semantics=kernel-observed`, the shared `timestamp_domain`, and
@@ -28,6 +28,8 @@ Pass every rank shard from every candidate run. Each JSONL record must contain:
 - `requested_offset_us` for an offset experiment, and optionally `policy`;
 - semantic context fields that pair operation A and B, such as `iteration`,
   `microbatch`, and `layer`;
+- stable `process_group_id` and non-negative `communicator_sequence_id` values
+  for both operations;
 - `metadata.completion_observed=true` for asynchronous operations;
 - `sequence_consistent=false` when launch-order validation detects divergence.
 
