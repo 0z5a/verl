@@ -20,6 +20,8 @@ Pass every rank shard from every candidate run. Each JSONL record must contain:
   detected directly;
 - `gpu_start_timestamp_ns` and `gpu_end_timestamp_ns` from a common monotonic
   time domain across ranks;
+- `gpu_timestamp_semantics=kernel-observed`, the shared `timestamp_domain`, and
+  a measured non-negative `clock_sync_error_bound_us` for that domain;
 - `consumer_timestamp_ns` for operation B;
 - optionally, `critical_path_duration_us` on both records for the enclosing
   step's slowest-rank critical-path duration;
@@ -33,6 +35,10 @@ The default pairing fields also cover weight-version and bucket traces. Override
 them with `--pair-by` when a framework uses a different semantic boundary.
 Every selected run must contain a complete, contiguous rank set beginning at
 rank zero. The implementation has no topology-specific rank-count branch.
+CUDA-event eligibility/completion brackets may be inspected with the same tool,
+but they are rejected as policy evidence and produce `insufficient_evidence`.
+Likewise, evidence whose measured clock error exceeds
+`--max-clock-sync-error-us` cannot select or refine a policy.
 
 ## Decision rules
 

@@ -34,7 +34,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_PAIR_FIELDS = (
     "step",
     "iteration",
@@ -63,6 +63,9 @@ class RankPair:
     declared_world_size: int | None
     framework: str
     topology_class: str
+    timestamp_domain: str
+    gpu_timestamp_semantics: str
+    clock_sync_error_bound_us: float
     operation_a: str
     operation_b: str
     message_bytes_a: int
@@ -90,6 +93,8 @@ class RankPair:
         return (
             self.framework,
             self.topology_class,
+            self.timestamp_domain,
+            self.gpu_timestamp_semantics,
             self.operation_a,
             self.operation_b,
             self.message_bytes_a,
@@ -270,6 +275,13 @@ def _common_value(records: Sequence[Mapping[str, Any]], name: str) -> Any:
     return next(iter(values)) if values else None
 
 
+def _required_common_value(records: Sequence[Mapping[str, Any]], name: str) -> Any:
+    values = [_record_value(record, name) for record in records]
+    if any(value is None for value in values):
+        raise TraceFormatError(f"{name} must be present on both paired records")
+    return _common_value(records, name)
+
+
 def _validate_timestamps(record: Mapping[str, Any]) -> tuple[int, int]:
     start = _integer(record, "gpu_start_timestamp_ns")
     end = _integer(record, "gpu_end_timestamp_ns")
@@ -320,6 +332,20 @@ def _pair_records(
     topology_class = _common_value((record_a, record_b), "topology_class") or "unknown"
     if not isinstance(topology_class, str):
         raise TraceFormatError("topology_class must be a string")
+    timestamp_domain = _required_common_value((record_a, record_b), "timestamp_domain")
+    if not isinstance(timestamp_domain, str) or not timestamp_domain:
+        raise TraceFormatError("timestamp_domain must be a non-empty string")
+    gpu_timestamp_semantics = _required_common_value((record_a, record_b), "gpu_timestamp_semantics")
+    if gpu_timestamp_semantics not in {"kernel-observed", "event-bracket"}:
+        raise TraceFormatError("gpu_timestamp_semantics must be 'kernel-observed' or 'event-bracket'")
+    clock_sync_error_bound_us = _required_common_value((record_a, record_b), "clock_sync_error_bound_us")
+    if (
+        isinstance(clock_sync_error_bound_us, bool)
+        or not isinstance(clock_sync_error_bound_us, int | float)
+        or not math.isfinite(clock_sync_error_bound_us)
+        or clock_sync_error_bound_us < 0
+    ):
+        raise TraceFormatError("clock_sync_error_bound_us must be finite and non-negative")
     message_bytes_a = _integer(record_a, "message_bytes")
     message_bytes_b = _integer(record_b, "message_bytes")
     if message_bytes_a <= 0 or message_bytes_b <= 0:
@@ -368,6 +394,9 @@ def _pair_records(
         declared_world_size=declared_world_size,
         framework=framework,
         topology_class=topology_class,
+        timestamp_domain=timestamp_domain,
+        gpu_timestamp_semantics=gpu_timestamp_semantics,
+        clock_sync_error_bound_us=float(clock_sync_error_bound_us),
         operation_a=operation_a,
         operation_b=operation_b,
         message_bytes_a=message_bytes_a,
@@ -534,6 +563,7 @@ def summarize_candidate(candidate: Candidate) -> dict[str, Any]:
         "consumer_slack_us_p50": _rounded(percentile(consumer_slacks, 50)),
         "consumer_wait_us_p95": _rounded(percentile(consumer_waits, 95)),
         "rank_skew_us_p95": _rounded(percentile(rank_skews, 95)),
+        "clock_sync_error_bound_us": _rounded(max(pair.clock_sync_error_bound_us for pair in rank_pairs)),
         "sequence_consistent": all(trial.sequence_consistent for trial in candidate.trials),
     }
 
@@ -631,6 +661,8 @@ def _workload_dict(workload: tuple[Any, ...]) -> dict[str, Any]:
     (
         framework,
         topology_class,
+        timestamp_domain,
+        gpu_timestamp_semantics,
         operation_a,
         operation_b,
         message_bytes_a,
@@ -642,6 +674,8 @@ def _workload_dict(workload: tuple[Any, ...]) -> dict[str, Any]:
     return {
         "framework": framework,
         "topology_class": topology_class,
+        "timestamp_domain": timestamp_domain,
+        "gpu_timestamp_semantics": gpu_timestamp_semantics,
         "operation_a": operation_a,
         "operation_b": operation_b,
         "message_bytes_a": message_bytes_a,
@@ -697,6 +731,7 @@ def tune_workload(
     confidence: float = 0.95,
     bootstrap_resamples: int = 2000,
     min_trials: int = 2,
+    max_clock_sync_error_us: float = 50.0,
 ) -> dict[str, Any]:
     """Choose a safe policy and data-derived refinement offsets for one workload."""
 
@@ -712,6 +747,10 @@ def tune_workload(
     eligible = []
     for index, (candidate, summary) in enumerate(zip(candidates, summaries, strict=True)):
         reasons = []
+        if candidate.rank_pairs[0].gpu_timestamp_semantics != "kernel-observed":
+            reasons.append("kernel_observed_gpu_timestamps_required")
+        if float(summary["clock_sync_error_bound_us"]) > max_clock_sync_error_us:
+            reasons.append("clock_sync_error_bound_exceeded")
         if summary["trial_count"] < min_trials:
             reasons.append("insufficient_trials")
         if not summary["sequence_consistent"]:
@@ -769,9 +808,11 @@ def tune_workload(
     else:
         decision = "switch_policy"
 
-    focus_pool = eligible or [baseline_index]
-    focus_index = min(focus_pool, key=lambda index: _candidate_sort_key(summaries[index]))
-    next_candidates = _refinement_points(summaries, focus_index, minimum_slack_us)
+    if evidence_ready:
+        focus_index = min(eligible, key=lambda index: _candidate_sort_key(summaries[index]))
+        next_candidates = _refinement_points(summaries, focus_index, minimum_slack_us)
+    else:
+        next_candidates = []
     return {
         "workload_key": _workload_dict(workload),
         "decision": decision,
@@ -810,6 +851,7 @@ def tune_traces(
     confidence: float = 0.95,
     bootstrap_resamples: int = 2000,
     min_trials: int = 2,
+    max_clock_sync_error_us: float = 50.0,
 ) -> dict[str, Any]:
     """Build recommendations from framework-neutral semantic trace records."""
 
@@ -819,6 +861,8 @@ def tune_traces(
         raise ValueError("bootstrap_resamples must be non-negative")
     if min_trials <= 0:
         raise ValueError("min_trials must be positive")
+    if not math.isfinite(max_clock_sync_error_us) or max_clock_sync_error_us < 0:
+        raise ValueError("max_clock_sync_error_us must be finite and non-negative")
     if not pair_fields:
         raise ValueError("at least one pair field is required")
     pairs = pair_trace_records(records, operation_a, operation_b, pair_fields)
@@ -830,6 +874,7 @@ def tune_traces(
             confidence=confidence,
             bootstrap_resamples=bootstrap_resamples,
             min_trials=min_trials,
+            max_clock_sync_error_us=max_clock_sync_error_us,
         )
         for workload, candidates in sorted(by_workload.items(), key=lambda item: repr(item[0]))
     ]
@@ -838,6 +883,7 @@ def tune_traces(
         "operation_a": operation_a,
         "operation_b": operation_b,
         "pair_fields": list(pair_fields),
+        "max_clock_sync_error_us": max_clock_sync_error_us,
         "recommendations": recommendations,
     }
 
@@ -875,6 +921,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--confidence", type=float, default=0.95)
     parser.add_argument("--bootstrap-resamples", type=int, default=2000)
     parser.add_argument("--min-trials", type=int, default=2)
+    parser.add_argument(
+        "--max-clock-sync-error-us",
+        type=float,
+        default=50.0,
+        help="largest measured cross-rank clock error allowed for a policy recommendation",
+    )
     parser.add_argument("--output-json", type=Path, required=True)
     return parser
 
@@ -890,6 +942,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             confidence=args.confidence,
             bootstrap_resamples=args.bootstrap_resamples,
             min_trials=args.min_trials,
+            max_clock_sync_error_us=args.max_clock_sync_error_us,
         )
     except (OSError, TraceFormatError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)

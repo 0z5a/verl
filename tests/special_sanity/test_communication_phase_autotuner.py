@@ -51,6 +51,9 @@ def _candidate_records(
                 "requested_offset_us": requested_offset_us,
                 "topology_class": "logical-fixture",
                 "transport": "fixture",
+                "timestamp_domain": "fixture-global-monotonic",
+                "gpu_timestamp_semantics": "kernel-observed",
+                "clock_sync_error_bound_us": 1.0,
                 "metadata": {
                     "policy": policy,
                     "completion_observed": True,
@@ -341,7 +344,8 @@ def test_cli_writes_machine_readable_recommendation(tmp_path):
         == 0
     )
     payload = json.loads(output.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
+    assert payload["max_clock_sync_error_us"] == 50.0
     assert payload["recommendations"][0]["workload_key"]["world_size"] == 2
 
 
@@ -373,3 +377,65 @@ def test_realized_offset_direction_mismatch_is_not_recommended():
         candidate for candidate in recommendation["candidates"] if candidate["requested_offset_us"] == 200.0
     )
     assert "realized_offset_direction_mismatch" in candidate["rejection_reasons"]
+
+
+def test_event_brackets_are_diagnostic_only_and_do_not_refine():
+    records = deepcopy(_trace_fixture(2))
+    for record in records:
+        record["gpu_timestamp_semantics"] = "event-bracket"
+
+    recommendation = tune_traces(records, "comm_a", "comm_b", bootstrap_resamples=200)["recommendations"][0]
+
+    assert recommendation["decision"] == "insufficient_evidence"
+    assert recommendation["refinement"]["next_candidates"] == []
+    assert all(
+        "kernel_observed_gpu_timestamps_required" in candidate["rejection_reasons"]
+        for candidate in recommendation["candidates"]
+    )
+
+
+def test_clock_sync_error_bound_fails_closed():
+    records = deepcopy(_trace_fixture(4))
+    for record in records:
+        record["clock_sync_error_bound_us"] = 75.0
+
+    recommendation = tune_traces(
+        records,
+        "comm_a",
+        "comm_b",
+        bootstrap_resamples=200,
+        max_clock_sync_error_us=50.0,
+    )["recommendations"][0]
+
+    assert recommendation["decision"] == "insufficient_evidence"
+    assert recommendation["refinement"]["next_candidates"] == []
+    assert all(
+        "clock_sync_error_bound_exceeded" in candidate["rejection_reasons"]
+        for candidate in recommendation["candidates"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("gpu_timestamp_semantics", "assumed-kernel", "gpu_timestamp_semantics"),
+        ("timestamp_domain", "", "timestamp_domain"),
+        ("clock_sync_error_bound_us", -1.0, "clock_sync_error_bound_us"),
+    ],
+)
+def test_timing_provenance_contract_rejects_invalid_values(field, value, message):
+    records = deepcopy(_trace_fixture(2))
+    for record in records:
+        record[field] = value
+
+    with pytest.raises(TraceFormatError, match=message):
+        tune_traces(records, "comm_a", "comm_b")
+
+
+def test_timing_provenance_is_required_on_both_pair_members():
+    records = deepcopy(_trace_fixture(2))
+    record = next(item for item in records if item["operation"] == "comm_b")
+    del record["gpu_timestamp_semantics"]
+
+    with pytest.raises(TraceFormatError, match="must be present on both paired records"):
+        tune_traces(records, "comm_a", "comm_b")
