@@ -13,9 +13,9 @@
 # limitations under the License.
 """Low-overhead semantic NVTX ranges for distributed communication.
 
-Set ``VERL_COMM_TRACE=0`` before importing this module to disable the ranges.
-The default is enabled so an Nsight Systems run contains semantic collective
-names without requiring a second, differently configured training run.
+Set ``VERL_COMM_TRACE=1`` before importing this module to enable the ranges.
+The default is disabled so normal training does not pay NVTX or metadata
+construction overhead unless semantic communication tracing is requested.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ _TRACE_FIELDS = (
     "logical_sequence_id",
     "requested_offset_us",
 )
-_COMM_TRACE_ENABLED = os.environ.get("VERL_COMM_TRACE", "1").lower() not in {"0", "false", "off", "no"}
+_COMM_TRACE_ENABLED = os.environ.get("VERL_COMM_TRACE", "0").lower() not in {"0", "false", "off", "no"}
 _COMM_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar("verl_comm_trace_context", default=None)
 _SEQUENCE_LOCK = threading.Lock()
 _SEQUENCE_IDS: dict[tuple[int, str | None], int] = {}
@@ -55,9 +55,18 @@ def _process_group_id(group: dist.ProcessGroup | None) -> str:
             return "world"
         group = dist.group.WORLD
     name = getattr(group, "group_name", None)
+    if name is None:
+        get_group_name = getattr(dist, "_get_process_group_name", None)
+        if callable(get_group_name):
+            name = get_group_name(group)
     if name is not None:
         return str(name)
-    return "world" if group is dist.group.WORLD else f"group-size-{dist.get_world_size(group)}"
+    if group is dist.group.WORLD:
+        return "world"
+    get_group_ranks = getattr(dist, "get_process_group_ranks", None)
+    if callable(get_group_ranks):
+        return "ranks-" + ",".join(str(rank) for rank in get_group_ranks(group))
+    return f"unnamed-group-size-{dist.get_world_size(group)}"
 
 
 def _next_sequence_id(group: dist.ProcessGroup | None, process_group_id: str | None = None) -> int:
@@ -70,15 +79,22 @@ def _next_sequence_id(group: dist.ProcessGroup | None, process_group_id: str | N
     return sequence_id
 
 
-def _nvtx_available() -> bool:
-    """Return whether this process can emit NVIDIA NVTX ranges."""
+def _get_nvtx_range():
+    """Return the platform NVTX range factory when NVIDIA tracing is available."""
 
-    return (
-        _COMM_TRACE_ENABLED
-        and getattr(torch.version, "hip", None) is None
-        and torch.cuda.is_available()
-        and callable(getattr(getattr(torch.cuda, "nvtx", None), "range", None))
-    )
+    if not _COMM_TRACE_ENABLED:
+        return None
+    # Keep this import lazy. ``comm_trace`` is also used by lightweight tools
+    # that deliberately do not import verl's worker/runtime dependencies.
+    from verl.utils.device import get_torch_device, get_vendor
+
+    if get_vendor() != "nvidia":
+        return None
+    device_module = get_torch_device()
+    if not device_module.is_available():
+        return None
+    nvtx_range = getattr(getattr(device_module, "nvtx", None), "range", None)
+    return nvtx_range if callable(nvtx_range) else None
 
 
 def format_communication_range(operation: str, **metadata: Any) -> str:
@@ -100,6 +116,9 @@ def communication_trace_context(**metadata: Any) -> Iterator[None]:
     unknown = metadata.keys() - _TRACE_FIELDS
     if unknown:
         raise ValueError(f"unsupported communication trace fields: {sorted(unknown)}")
+    if not _COMM_TRACE_ENABLED:
+        yield
+        return
     merged = {**(_COMM_CONTEXT.get() or {}), **{key: value for key, value in metadata.items() if value is not None}}
     token = _COMM_CONTEXT.set(merged)
     try:
@@ -130,7 +149,8 @@ def communication_nvtx_range(
     with its Ulysses/FSDP/Megatron meaning.
     """
 
-    if not _nvtx_available():
+    nvtx_range = _get_nvtx_range()
+    if nvtx_range is None:
         yield
         return
     metadata = dict(_COMM_CONTEXT.get() or {})
@@ -162,5 +182,5 @@ def communication_nvtx_range(
         }
     )
     message = format_communication_range(operation, **metadata)
-    with torch.cuda.nvtx.range(message):
+    with nvtx_range(message):
         yield

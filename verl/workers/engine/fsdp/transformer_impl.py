@@ -721,6 +721,7 @@ class FSDPEngine(BaseEngine):
         # note that the global_batch_size should include data on all the dp
         tu.assign_non_tensor(data, sp_size=self.ulysses_sequence_parallel_size)
         return_model_output = tu.get_non_tensor_data(data=data, key="return_model_output", default=False)
+        global_step = tu.get(data, key="global_steps", default=None)
 
         # compute num_tokens in global batch for loss normalization
         batch_num_tokens = data["loss_mask"].sum().to(get_device_id())
@@ -754,7 +755,7 @@ class FSDPEngine(BaseEngine):
             # distinguishable "micro_batch<i>" row -- nested under the update loop's "mini_batch<i>"
             # when training, or directly under the stage for log-prob.
             with (
-                communication_trace_context(microbatch=micro_batch_idx),
+                communication_trace_context(step=global_step, microbatch=micro_batch_idx),
                 ctx,
                 sync_ctx,
                 torch.profiler.record_function(f"micro_batch{micro_batch_idx}"),

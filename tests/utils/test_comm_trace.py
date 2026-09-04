@@ -28,6 +28,14 @@ comm_trace = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(comm_trace)
 
 
+def _reload_comm_trace(module_name: str):
+    spec = importlib.util.spec_from_file_location(module_name, _MODULE_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _load_ulysses_module(monkeypatch):
     verl_package = types.ModuleType("verl")
     verl_package.__path__ = []
@@ -45,8 +53,35 @@ def _load_ulysses_module(monkeypatch):
     return module
 
 
+def _install_fake_device_api(monkeypatch, *, vendor, device_module):
+    verl_package = types.ModuleType("verl")
+    verl_package.__path__ = []
+    utils_package = types.ModuleType("verl.utils")
+    utils_package.__path__ = []
+    device_api = types.ModuleType("verl.utils.device")
+    device_api.get_vendor = lambda: vendor
+    device_api.get_torch_device = lambda: device_module
+    monkeypatch.setitem(sys.modules, "verl", verl_package)
+    monkeypatch.setitem(sys.modules, "verl.utils", utils_package)
+    monkeypatch.setitem(sys.modules, "verl.utils.device", device_api)
+
+
 class _FakeGroup:
     group_name = "sp-group-0"
+
+
+class _UnnamedGroup:
+    pass
+
+
+def test_trace_is_disabled_by_default_and_requires_explicit_opt_in(monkeypatch):
+    monkeypatch.delenv("VERL_COMM_TRACE", raising=False)
+    default_module = _reload_comm_trace("comm_trace_default_under_test")
+    assert default_module._COMM_TRACE_ENABLED is False
+
+    monkeypatch.setenv("VERL_COMM_TRACE", "1")
+    enabled_module = _reload_comm_trace("comm_trace_enabled_under_test")
+    assert enabled_module._COMM_TRACE_ENABLED is True
 
 
 def test_format_communication_range_has_stable_field_order_and_escaping():
@@ -71,8 +106,7 @@ def test_communication_trace_context_is_nested_and_restored(monkeypatch):
         yield
 
     monkeypatch.setattr(comm_trace, "_COMM_TRACE_ENABLED", True)
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda.nvtx, "range", fake_range)
+    monkeypatch.setattr(comm_trace, "_get_nvtx_range", lambda: fake_range)
 
     tensor = torch.empty(16, dtype=torch.float32)
     with comm_trace.communication_trace_context(step=3, microbatch=2, layer=11, logical_sequence_id="3/2/11"):
@@ -90,15 +124,36 @@ def test_communication_trace_context_is_nested_and_restored(monkeypatch):
 
 def test_disabled_trace_is_a_noop(monkeypatch):
     monkeypatch.setattr(comm_trace, "_COMM_TRACE_ENABLED", False)
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: pytest.fail("CUDA probe should not run"))
-    with comm_trace.communication_nvtx_range("ulysses_a2a"):
-        pass
+    monkeypatch.setattr(comm_trace, "_get_nvtx_range", lambda: None)
+    with comm_trace.communication_trace_context(step=9):
+        assert comm_trace._COMM_CONTEXT.get() is None
+        with comm_trace.communication_nvtx_range("ulysses_a2a"):
+            pass
 
 
-def test_rocm_trace_is_a_noop(monkeypatch):
+def test_unnamed_process_group_uses_membership_not_only_size(monkeypatch):
+    group = _UnnamedGroup()
+    monkeypatch.setattr(comm_trace.dist, "_get_process_group_name", None, raising=False)
+    monkeypatch.setattr(comm_trace.dist, "get_process_group_ranks", lambda candidate: [0, 2])
+    assert comm_trace._process_group_id(group) == "ranks-0,2"
+
+
+def test_nvtx_factory_uses_platform_device_abstraction(monkeypatch):
+    @contextmanager
+    def fake_range(_message):
+        yield
+
+    device_module = types.SimpleNamespace(is_available=lambda: True, nvtx=types.SimpleNamespace(range=fake_range))
+    _install_fake_device_api(monkeypatch, vendor="nvidia", device_module=device_module)
     monkeypatch.setattr(comm_trace, "_COMM_TRACE_ENABLED", True)
-    monkeypatch.setattr(torch.version, "hip", "6.3")
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: pytest.fail("CUDA probe should not run on ROCm"))
+    assert comm_trace._get_nvtx_range() is fake_range
+
+
+def test_non_nvidia_trace_is_a_noop(monkeypatch):
+    device_module = types.SimpleNamespace(is_available=lambda: pytest.fail("device probe should not run"))
+    _install_fake_device_api(monkeypatch, vendor="amd", device_module=device_module)
+    monkeypatch.setattr(comm_trace, "_COMM_TRACE_ENABLED", True)
+    assert comm_trace._get_nvtx_range() is None
     with comm_trace.communication_nvtx_range("ulysses_a2a"):
         pass
 
@@ -118,8 +173,7 @@ def test_explicit_process_group_id_supports_non_torch_collectives(monkeypatch):
         yield
 
     monkeypatch.setattr(comm_trace, "_COMM_TRACE_ENABLED", True)
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda.nvtx, "range", fake_range)
+    monkeypatch.setattr(comm_trace, "_get_nvtx_range", lambda: fake_range)
     with comm_trace.communication_nvtx_range(
         "weight_sync",
         step=19,
