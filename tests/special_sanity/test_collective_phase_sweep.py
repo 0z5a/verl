@@ -44,7 +44,7 @@ def test_general_mesh_layout():
     ("world_size", "expected"),
     [(4, "mesh-2x2"), (6, "mesh-2x3"), (8, "mesh-2x4"), (12, "mesh-3x4")],
 )
-def test_auto_layout_is_not_tied_to_six_ranks(world_size, expected):
+def test_auto_layout_supports_general_factorizations(world_size, expected):
     assert resolve_group_layout("auto", world_size) == (
         expected,
         tuple(int(value) for value in expected.removeprefix("mesh-").split("x")),

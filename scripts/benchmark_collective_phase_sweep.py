@@ -14,9 +14,9 @@
 """Benchmark phase scheduling for collectives on overlapping process groups.
 
 The benchmark deliberately has no dependency on the rest of verl. A typical
-six-GPU run is::
+four-GPU run is::
 
-    torchrun --standalone --nproc-per-node=6 \
+    torchrun --standalone --nproc-per-node=4 \
       scripts/benchmark_collective_phase_sweep.py \
       --comm-a all-to-all --comm-b reduce-scatter \
       --group-layout auto --offset-us -4000 -2000 -1000 -500 0 500 1000 2000 4000 \
