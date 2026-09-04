@@ -37,6 +37,7 @@ from verl.trainer.config import CheckpointConfig
 from verl.utils import tensordict_utils as tu
 from verl.utils.activation_offload import enable_activation_offloading
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
+from verl.utils.comm_trace import communication_trace_context
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.device import get_device_id, get_device_name
@@ -752,7 +753,12 @@ class FSDPEngine(BaseEngine):
             # inside; here every micro-batch forward (and, when training, its backward) becomes a
             # distinguishable "micro_batch<i>" row -- nested under the update loop's "mini_batch<i>"
             # when training, or directly under the stage for log-prob.
-            with ctx, sync_ctx, torch.profiler.record_function(f"micro_batch{micro_batch_idx}"):
+            with (
+                communication_trace_context(microbatch=micro_batch_idx),
+                ctx,
+                sync_ctx,
+                torch.profiler.record_function(f"micro_batch{micro_batch_idx}"),
+            ):
                 loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
 
                 if not forward_only:
