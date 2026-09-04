@@ -136,6 +136,78 @@ NIC traffic classes, rail assignment, and route selection are outside this
 policy layer. `topology_signature` is only an opaque compatibility identity; it
 does not configure or infer any NIC behavior.
 
+## NIC and rail policy eligibility
+
+`scripts/communication_network_policy.py` adds a second, stricter gate for a
+policy measured with explicit NIC rail or traffic-class bindings. It remains an
+offline tool: it never writes host QoS settings, selects routes, changes a NIC,
+or applies a recommendation to a training process.
+
+The operator-authored NIC capability JSON must contain:
+
+- the complete topology fingerprint and its matching `topology_cell_id`;
+- an explicit `infiniband` or `roce` fabric;
+- an opaque inventory signature covering the NIC, firmware, wiring, and
+  operator-defined logical rail namespace;
+- every rank from the topology cell, every logical rail visible to that rank,
+  and the explicit traffic classes supported by each rail.
+
+NIC eligibility is restricted to multi-node topology cells. Missing ranks,
+empty capability sets, unsupported fabrics, and sentinel values such as
+`unknown`, `unspecified`, or `auto` are rejected.
+
+Each selected source trace record must also contain:
+
+- `network_telemetry_observed=true`;
+- `network_fabric` and `nic_inventory_signature` matching the capability JSON;
+- an explicit `network_telemetry_source` and
+  `network_telemetry_schema_signature`;
+- the observed `nic_rail_id` and `nic_traffic_class`.
+
+Every selected operation must have a consistent observed binding on every
+rank. Build the eligibility block from only the trace shards that measured one
+candidate:
+
+```bash
+python scripts/communication_network_policy.py build \
+  --capabilities-json measured-nic-capabilities.json \
+  --trace-jsonl measured-policy/rank-*.jsonl \
+  --operation ep_dispatch_tokens \
+  --operation dp_grad_reduce_scatter \
+  --output-json measured-policy-eligibility.json
+```
+
+The telemetry compatibility cell identifies the exact topology, NIC
+capabilities, telemetry source, and telemetry schema. The policy eligibility
+digest separately binds that cell to the complete observed rail/class
+assignment. This separation permits measured assignments to be compared inside
+one compatible environment without treating one assignment as evidence for a
+different environment.
+
+Attach the generated `network_policy_eligibility` object only to the
+recommendation produced from those source traces. Then gate that recommendation
+against telemetry from the target environment:
+
+```bash
+python scripts/communication_network_policy.py select \
+  --policy-json phase-policy-with-network-eligibility.json \
+  --capabilities-json target-nic-capabilities.json \
+  --target-trace-jsonl target-probe/rank-*.jsonl \
+  --operation ep_dispatch_tokens \
+  --operation dp_grad_reduce_scatter \
+  --output-json eligible-policy.json
+```
+
+Selection requires an exact telemetry-cell match and verifies that every
+required rank binding is present in the target capability inventory.
+Unannotated recommendations are not a fallback. A changed inventory,
+telemetry schema, topology, rail, or traffic class requires new measurements.
+
+The CPU fixtures for this interface use logical two- and four-rank evidence.
+They validate the schema and rejection rules only; they do not establish an
+InfiniBand or RoCE performance benefit. Real multi-node NIC telemetry and
+operator review are required before using a selected policy.
+
 An aggregate phase-sweep summary may record isolated/contended latency and
 GPU-realized offsets, but it has no consumer timestamp. Feed semantic trace
 records to this tool; do not infer consumer slack from aggregate collective
