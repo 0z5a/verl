@@ -11,15 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Two-rank CPU smoke test for the collective phase-sweep benchmark."""
+"""Two/four-rank Gloo smoke tests, including original rank-level capture."""
 
 import json
 import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 
-def test_collective_phase_sweep_two_rank_smoke(tmp_path: Path):
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_collective_phase_sweep_rank_smoke(tmp_path: Path, world_size: int):
     repository_root = Path(__file__).parents[2]
     output = tmp_path / "phase_sweep.json"
     command = [
@@ -27,14 +30,14 @@ def test_collective_phase_sweep_two_rank_smoke(tmp_path: Path):
         "-m",
         "torch.distributed.run",
         "--standalone",
-        "--nproc-per-node=2",
+        f"--nproc-per-node={world_size}",
         str(repository_root / "scripts" / "benchmark_collective_phase_sweep.py"),
         "--backend",
         "gloo",
         "--device",
         "cpu",
         "--group-layout",
-        "world",
+        "auto",
         "--comm-a",
         "all-to-all",
         "--comm-b",
@@ -59,12 +62,16 @@ def test_collective_phase_sweep_two_rank_smoke(tmp_path: Path):
         "--no-shuffle-offsets",
         "--output-json",
         str(output),
+        "--trace-jsonl",
+        str(tmp_path / "raw-{rank}.jsonl"),
     ]
     subprocess.run(command, cwd=repository_root, check=True, timeout=120)
 
     payload = json.loads(output.read_text())
     assert payload["schema_version"] == 2
-    assert payload["world_size"] == 2
+    assert payload["world_size"] == world_size
+    assert payload["raw_trace_enabled"] is True
+    assert payload["raw_trace_schema_version"] == 3
     assert payload["timestamp_domain"] == "single-node-perf-counter"
     assert payload["gpu_timestamp_semantics"] == "event-bracket"
     assert payload["kernel_observed"] is False
@@ -93,3 +100,25 @@ def test_collective_phase_sweep_two_rank_smoke(tmp_path: Path):
         "stretch_b",
     }
     assert required_metrics <= offset_results[0].keys()
+    for rank in range(world_size):
+        rows = [json.loads(line) for line in (tmp_path / f"raw-{rank}.jsonl").read_text().splitlines()]
+        assert len(rows) == 36
+        assert {row["run_id"] for row in rows} == {payload["run_id"]}
+        assert {row["sample_phase"] for row in rows} == {"warmup", "measurement"}
+        sequences = {}
+        for row in rows:
+            assert row["rank"] == rank
+            assert rank in row["process_group_ranks"]
+            assert row["gpu_start_timestamp_ns"] is None
+            assert row["gpu_end_timestamp_ns"] is None
+            assert row["gpu_timestamp_semantics"] == "not-applicable"
+            assert row["api_launch_timestamp_ns"] <= row["api_return_timestamp_ns"] <= row["completion_timestamp_ns"]
+            assert (
+                row["completion_timestamp_ns"]
+                <= row["consumer_timestamp_ns"]
+                <= row["buffer_reuse_release_timestamp_ns"]
+            )
+            sequences.setdefault(row["process_group_id"], []).append(row["communicator_sequence_id"])
+        assert len(sequences) == 2
+        for values in sequences.values():
+            assert values == list(range(len(values)))

@@ -105,6 +105,7 @@ class LocalObservation:
     a_api_launch_ns: int | None = None
     b_api_launch_ns: int | None = None
     launch_anchor_lateness_us: float | None = None
+    collectives: dict[str, dict[str, Any]] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass
@@ -112,6 +113,109 @@ class CudaLaunch:
     start: torch.cuda.Event
     end: torch.cuda.Event
     api_launch_ns: int
+    api_return_ns: int
+    sequence_id: int
+    stream_id: int
+
+
+def policy_cell_id(mode: str, offset_us: float) -> str:
+    """Separate offset candidates even when they share one process invocation."""
+    if not math.isfinite(offset_us):
+        raise ValueError("offset must be finite")
+    return f"offset/{offset_us:.17g}us" if mode == "offset" else mode
+
+
+class NativeTraceWriter:
+    """Stream lossless rank-local records outside the measured trial region.
+
+    Transfer leases describe permission to reuse persistent benchmark buffers,
+    not physical CUDA allocation/free events. CPU timings remain host timings.
+    """
+
+    def __init__(self, path: Path, *, rank: int, world_size: int, run_id: str, backend: str):
+        self.path = path
+        self.rank, self.world_size, self.run_id, self.backend = rank, world_size, run_id, backend
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.output = path.open("x", encoding="utf-8")
+        self.records = 0
+
+    def emit(self, observation: LocalObservation, *, mode: str, offset_us: float, step: int, phase: str) -> None:
+        """Preserve measured boundaries, group membership and exact sequence IDs."""
+        for side, measured in observation.collectives.items():
+            pair_id = f"{self.run_id}/trial/{step}"
+            logical_id = f"{pair_id}/{side}"
+            record = {
+                "schema_version": 3,
+                "record_type": "collective",
+                "framework": "verl",
+                "run_id": self.run_id,
+                "process_launch_id": self.run_id,
+                "hostname": socket.gethostname(),
+                "rank": self.rank,
+                "world_size": self.world_size,
+                "step": step,
+                "direction": "benchmark",
+                "policy_id": policy_cell_id(mode, offset_us),
+                "sample_phase": phase,
+                "pair_id": pair_id,
+                "pair_role": side,
+                "logical_operation_id": logical_id,
+                "requested_offset_us": offset_us,
+                "transport": self.backend,
+                "topology_class": "single-node-measured",
+                "gpu_timestamp_semantics": "event-bracket" if self.backend == "nccl" else "not-applicable",
+                "timestamp_domain": (
+                    "single-node-perf-counter-projected-cuda-event"
+                    if self.backend == "nccl"
+                    else "single-node-perf-counter"
+                ),
+                "clock_sync_error_bound_us": None,
+                "kernel_observed": False,
+                **measured,
+            }
+            if self.backend != "nccl":
+                # Host collective durations are never renamed to GPU timestamps.
+                record["gpu_start_timestamp_ns"] = record["gpu_end_timestamp_ns"] = None
+            self.output.write(json.dumps(record, sort_keys=True, allow_nan=False) + "\n")
+            self.records += 1
+        self.output.flush()
+
+    def close(self) -> None:
+        """Close this writer without touching any other rank's artifact."""
+        self.output.close()
+
+
+def create_native_trace_writer(
+    template: str, *, rank: int, world_size: int, run_id: str, backend: str, summary_path: Path
+) -> NativeTraceWriter:
+    """Reject collisions or local filesystem errors on every rank before trials."""
+    writer = None
+    error = None
+    path = None
+    resolved = None
+    try:
+        path = Path(template.format(rank=rank))
+        if "{rank}" not in template:
+            path = path.with_name(f"{path.stem}.rank-{rank}{path.suffix}")
+        resolved = str(path.resolve())
+        if path.resolve() == summary_path.resolve():
+            raise ValueError("raw trace and summary output paths must differ")
+    except (OSError, ValueError, KeyError, IndexError) as exc:
+        error = str(exc)
+    choices = [None] * world_size
+    dist.all_gather_object(choices, (resolved, error))
+    if any(item[1] for item in choices) or len({item[0] for item in choices}) != world_size:
+        raise ValueError(f"invalid raw trace paths: {choices}")
+    try:
+        writer = NativeTraceWriter(path, rank=rank, world_size=world_size, run_id=run_id, backend=backend)
+    except OSError as exc:
+        error = str(exc)
+    dist.all_gather_object(choices, error)
+    if any(choices):
+        if writer is not None:
+            writer.close()
+        raise ValueError(f"raw trace files must be fresh and writable on every rank: {choices}")
+    return writer
 
 
 class SequenceTracker:
@@ -335,19 +439,22 @@ class BenchmarkRunner:
         device: torch.device,
         validate: bool,
         launch_anchor_lead_us: int,
+        trace_writer: NativeTraceWriter | None = None,
     ) -> None:
         self.buffer_a = buffer_a
         self.buffer_b = buffer_b
         self.device = device
         self.validate = validate
         self.launch_anchor_lead_us = launch_anchor_lead_us
+        self.trace_writer = trace_writer
+        self.trial_index = 0
         self.sequence_a = SequenceTracker()
         self.sequence_b = SequenceTracker()
         if device.type == "cuda":
             self.stream_a = torch.cuda.Stream(device=device)
             self.stream_b = torch.cuda.Stream(device=device)
 
-    def run_trial(self, mode: str, requested_offset_us: float = 0.0) -> LocalObservation:
+    def run_trial(self, mode: str, requested_offset_us: float = 0.0, *, phase: str = "measurement") -> LocalObservation:
         if mode not in ("isolated_a", "isolated_b", "concurrent", "serialized", "offset"):
             raise ValueError(f"unsupported trial mode: {mode}")
         self.buffer_a.reset()
@@ -360,7 +467,16 @@ class BenchmarkRunner:
             observation = self._run_cuda_trial(mode, requested_offset_us, anchor_ns)
         else:
             observation = self._run_cpu_trial(mode, requested_offset_us, anchor_ns)
-        self._validate(mode)
+        self._validate(mode, observation)
+        if self.trace_writer is not None:
+            # Every transfer has physically completed. After optional payload
+            # consumption, this is the boundary permitting the next buffer reset.
+            for record in observation.collectives.values():
+                record["buffer_reuse_release_timestamp_ns"] = time.perf_counter_ns()
+            self.trace_writer.emit(
+                observation, mode=mode, offset_us=requested_offset_us, step=self.trial_index, phase=phase
+            )
+        self.trial_index += 1
         return observation
 
     def _shared_launch_anchor_ns(self) -> int:
@@ -375,7 +491,7 @@ class BenchmarkRunner:
         stream: torch.cuda.Stream,
         ready: torch.cuda.Event,
     ) -> CudaLaunch:
-        tracker.record(buffer.operation)
+        sequence_id = tracker.record(buffer.operation)
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         api_launch_ns = time.perf_counter_ns()
@@ -383,11 +499,42 @@ class BenchmarkRunner:
             stream.wait_event(ready)
             start.record(stream)
             work = buffer.launch()
+            api_return_ns = time.perf_counter_ns()
             # NCCL work.wait() inserts a dependency from the NCCL stream into the
             # current CUDA stream without requiring a device-wide synchronize.
             work.wait()
             end.record(stream)
-        return CudaLaunch(start, end, api_launch_ns)
+        return CudaLaunch(start, end, api_launch_ns, api_return_ns, sequence_id, int(stream.cuda_stream))
+
+    def _raw_fields(
+        self,
+        buffer: CollectiveBuffer,
+        sequence_id: int,
+        stream_id: str,
+        launch_ns: int,
+        return_ns: int,
+        completion_ns: int,
+    ) -> dict[str, Any]:
+        ranks = dist.get_process_group_ranks(buffer.group)
+        # Group names distinguish two communicators with identical membership.
+        group_name = getattr(buffer.group, "group_name", None)
+        if group_name is None:
+            group_name = dist._get_process_group_name(buffer.group)
+        return {
+            "operation": buffer.operation,
+            "process_group_id": f"{dist.get_backend(buffer.group)}:{group_name}:ranks-{','.join(map(str, ranks))}",
+            "process_group_ranks": ranks,
+            "communicator_sequence_id": sequence_id,
+            "stream_id": stream_id,
+            "message_bytes": buffer.message_bytes,
+            "api_launch_timestamp_ns": launch_ns,
+            "api_return_timestamp_ns": return_ns,
+            "completion_timestamp_ns": completion_ns,
+            "consumer_timestamp_ns": None,
+            "buffer_reuse_acquire_timestamp_ns": launch_ns,
+            "resource_scope": "persistent-buffer-transfer-lease",
+            "completion_semantics": "host-observed-physical-completion",
+        }
 
     def _run_cuda_trial(self, mode: str, requested_offset_us: float, anchor_host_ns: int) -> LocalObservation:
         _wait_until_ns(anchor_host_ns)
@@ -416,9 +563,23 @@ class BenchmarkRunner:
             _wait_until_ns(anchor_host_ns + int(-requested_offset_us * 1000))
             launch_a = self._launch_cuda(self.buffer_a, self.sequence_a, self.stream_a, ready)
 
-        for launch in (launch_a, launch_b):
+        raw = {}
+        for side, launch, buffer in (("a", launch_a, self.buffer_a), ("b", launch_b, self.buffer_b)):
             if launch is not None:
                 launch.end.synchronize()
+                if self.trace_writer is not None:
+                    raw[side] = self._raw_fields(
+                        buffer,
+                        launch.sequence_id,
+                        str(launch.stream_id),
+                        launch.api_launch_ns,
+                        launch.api_return_ns,
+                        time.perf_counter_ns(),
+                    )
+                    raw[side].update(
+                        gpu_start_timestamp_ns=round(_event_timestamp_us(ready, launch.start, anchor_host_ns) * 1000),
+                        gpu_end_timestamp_ns=round(_event_timestamp_us(ready, launch.end, anchor_host_ns) * 1000),
+                    )
         return LocalObservation(
             a_start_us=_event_timestamp_us(ready, launch_a.start, anchor_host_ns) if launch_a else None,
             a_end_us=_event_timestamp_us(ready, launch_a.end, anchor_host_ns) if launch_a else None,
@@ -427,6 +588,7 @@ class BenchmarkRunner:
             a_api_launch_ns=launch_a.api_launch_ns if launch_a else None,
             b_api_launch_ns=launch_b.api_launch_ns if launch_b else None,
             launch_anchor_lateness_us=(gate_release_ns - anchor_host_ns) / 1000,
+            collectives=raw,
         )
 
     def _run_cpu_trial(self, mode: str, requested_offset_us: float, anchor_ns: int) -> LocalObservation:
@@ -434,6 +596,7 @@ class BenchmarkRunner:
         lock = threading.Lock()
         go = threading.Event()
         start_barrier: threading.Barrier | None = None
+        worker_failures: list[BaseException] = []
 
         def launch(which: str, delay_us: float) -> None:
             if start_barrier is not None:
@@ -442,16 +605,31 @@ class BenchmarkRunner:
             _wait_until_ns(anchor_ns + int(delay_us * 1000))
             buffer = self.buffer_a if which == "a" else self.buffer_b
             tracker = self.sequence_a if which == "a" else self.sequence_b
-            tracker.record(buffer.operation)
+            sequence_id = tracker.record(buffer.operation)
             api_ns = time.perf_counter_ns()
             start_us = api_ns / 1000
             work = buffer.launch()
+            return_ns = time.perf_counter_ns()
             work.wait()
-            end_us = time.perf_counter_ns() / 1000
+            completion_ns = time.perf_counter_ns()
+            end_us = completion_ns / 1000
             with lock:
                 setattr(observation, f"{which}_api_launch_ns", api_ns)
                 setattr(observation, f"{which}_start_us", start_us)
                 setattr(observation, f"{which}_end_us", end_us)
+                if self.trace_writer is not None:
+                    observation.collectives[which] = self._raw_fields(
+                        buffer, sequence_id, f"host-thread-{which}", api_ns, return_ns, completion_ns
+                    )
+
+        def guarded_launch(which: str, delay_us: float) -> None:
+            try:
+                launch(which, delay_us)
+            except BaseException as error:
+                # Exceptions in Python threads otherwise do not reach the
+                # caller, which could publish a partially observed trial.
+                with lock:
+                    worker_failures.append(error)
 
         if mode in ("isolated_a", "isolated_b", "serialized"):
             go.set()
@@ -470,8 +648,8 @@ class BenchmarkRunner:
                 delay_b_us = max(0.0, requested_offset_us)
             start_barrier = threading.Barrier(3)
             threads = [
-                threading.Thread(target=launch, args=("a", delay_a_us)),
-                threading.Thread(target=launch, args=("b", delay_b_us)),
+                threading.Thread(target=guarded_launch, args=("a", delay_a_us)),
+                threading.Thread(target=guarded_launch, args=("b", delay_b_us)),
             ]
             for thread in threads:
                 thread.start()
@@ -479,17 +657,23 @@ class BenchmarkRunner:
             go.set()
             for thread in threads:
                 thread.join()
+            if worker_failures:
+                raise RuntimeError("CPU collective worker failed") from worker_failures[0]
         starts = [value for value in (observation.a_api_launch_ns, observation.b_api_launch_ns) if value is not None]
         observation.launch_anchor_lateness_us = (min(starts) - anchor_ns) / 1000
         return observation
 
-    def _validate(self, mode: str) -> None:
+    def _validate(self, mode: str, observation: LocalObservation) -> None:
         if not self.validate:
             return
         correct = True
         if mode != "isolated_b":
+            if "a" in observation.collectives:
+                observation.collectives["a"]["consumer_timestamp_ns"] = time.perf_counter_ns()
             correct = correct and self.buffer_a.is_correct()
         if mode != "isolated_a":
+            if "b" in observation.collectives:
+                observation.collectives["b"]["consumer_timestamp_ns"] = time.perf_counter_ns()
             correct = correct and self.buffer_b.is_correct()
         flag = torch.tensor(int(correct), dtype=torch.int32, device=self.device)
         dist.all_reduce(flag, op=dist.ReduceOp.MIN)
@@ -617,7 +801,7 @@ def _run_series(
     world_size: int,
 ) -> dict[str, float | None] | None:
     for _ in range(warmup):
-        runner.run_trial(mode, offset_us)
+        runner.run_trial(mode, offset_us, phase="warmup")
     gathered_iterations = []
     for _ in range(iterations):
         observation = runner.run_trial(mode, offset_us)
@@ -751,6 +935,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="lead time for the rank-0-broadcast absolute launch anchor",
     )
     parser.add_argument("--output-json", type=Path, required=True)
+    parser.add_argument("--trace-jsonl", help="Optional fresh rank-local raw trace path, with a {rank} placeholder")
     parser.add_argument("--validate", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--shuffle-offsets", action=argparse.BooleanOptionalAction, default=True)
     return parser
@@ -763,6 +948,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--timeout-s must be positive")
     if args.launch_anchor_lead_us <= 0:
         raise ValueError("--launch-anchor-lead-us must be positive")
+    if any(not math.isfinite(offset) for offset in args.offset_us):
+        raise ValueError("--offset-us values must be finite")
     if args.comm_a not in COMM_A_CHOICES:
         raise ValueError("--comm-a must be an all-to-all collective")
     if args.comm_b not in COMM_B_CHOICES:
@@ -807,12 +994,25 @@ def main(argv: list[str] | None = None) -> int:
         init_kwargs["device_id"] = device
     dist.init_process_group(**init_kwargs)
     groups: GroupContext | None = None
+    trace_writer = None
     try:
+        run_ids = [str(uuid.uuid4()) if rank == 0 else None]
+        dist.broadcast_object_list(run_ids, src=0)
+        run_id = run_ids[0]
+        if args.trace_jsonl:
+            trace_writer = create_native_trace_writer(
+                args.trace_jsonl,
+                rank=rank,
+                world_size=world_size,
+                run_id=run_id,
+                backend=backend,
+                summary_path=args.output_json,
+            )
         groups = _create_groups(args.group_layout, world_size, rank, mesh_shape)
         dtype = DTYPES[args.dtype]
         buffer_a = CollectiveBuffer(args.comm_a, args.message_bytes_a, dtype, device, groups.group_a)
         buffer_b = CollectiveBuffer(args.comm_b, args.message_bytes_b, dtype, device, groups.group_b)
-        runner = BenchmarkRunner(buffer_a, buffer_b, device, args.validate, args.launch_anchor_lead_us)
+        runner = BenchmarkRunner(buffer_a, buffer_b, device, args.validate, args.launch_anchor_lead_us, trace_writer)
         topology = _describe_topology(device, rank, world_size)
         _require_single_node(topology, rank)
 
@@ -889,7 +1089,9 @@ def main(argv: list[str] | None = None) -> int:
         if rank == 0:
             payload = {
                 "schema_version": SCHEMA_VERSION,
-                "run_id": str(uuid.uuid4()),
+                "run_id": run_id,
+                "raw_trace_schema_version": 3 if trace_writer else None,
+                "raw_trace_enabled": trace_writer is not None,
                 "framework": "verl",
                 "created_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 "world_size": world_size,
@@ -951,6 +1153,8 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(payload, sort_keys=True))
         dist.barrier()
     finally:
+        if trace_writer is not None:
+            trace_writer.close()
         if dist.is_initialized():
             dist.destroy_process_group()
     return 0

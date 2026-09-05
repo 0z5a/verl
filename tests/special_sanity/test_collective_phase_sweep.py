@@ -13,15 +13,23 @@
 # limitations under the License.
 
 import argparse
+import json
+import time
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 from scripts.benchmark_collective_phase_sweep import (
+    BenchmarkRunner,
+    LocalObservation,
+    NativeTraceWriter,
     _require_single_node,
     _topology_has_nvlink,
     build_group_specs,
     parse_size,
     percentile,
+    policy_cell_id,
     resolve_group_layout,
 )
 
@@ -81,3 +89,66 @@ def test_multi_node_clock_domain_is_rejected(monkeypatch):
     )
     with pytest.raises(RuntimeError, match="perf_counter_ns anchors are not portable"):
         _require_single_node({"topology_class": "multi-node"}, rank=0)
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("backend", ["gloo", "nccl"])
+def test_native_writer_preserves_raw_boundaries_and_cpu_is_not_gpu(tmp_path, world_size, backend):
+    path = tmp_path / "trace.jsonl"
+    writer = NativeTraceWriter(path, rank=0, world_size=world_size, run_id="logical-fixture", backend=backend)
+    observed = dict(
+        operation="all_reduce",
+        process_group_id="explicit",
+        process_group_ranks=list(range(world_size)),
+        communicator_sequence_id=19,
+        api_launch_timestamp_ns=100,
+        api_return_timestamp_ns=110,
+        completion_timestamp_ns=150,
+        consumer_timestamp_ns=170,
+        message_bytes=16,
+        gpu_start_timestamp_ns=120,
+        gpu_end_timestamp_ns=140,
+        buffer_reuse_acquire_timestamp_ns=100,
+        buffer_reuse_release_timestamp_ns=180,
+        resource_scope="persistent-buffer-transfer-lease",
+    )
+    writer.emit(
+        LocalObservation(collectives={"b": observed}), mode="offset", offset_us=-10, step=7, phase="measurement"
+    )
+    writer.close()
+    raw = json.loads(path.read_text())
+    assert raw["schema_version"] == 3
+    assert raw["communicator_sequence_id"] == 19
+    assert raw["process_group_ranks"] == list(range(world_size))
+    assert raw["policy_id"] == "offset/-10us"
+    assert raw["completion_timestamp_ns"] == 150
+    assert raw["consumer_timestamp_ns"] == 170
+    assert raw["gpu_start_timestamp_ns"] == (120 if backend == "nccl" else None)
+    assert raw["clock_sync_error_bound_us"] is None
+    with pytest.raises(FileExistsError):
+        NativeTraceWriter(path, rank=0, world_size=world_size, run_id="second", backend=backend)
+
+
+@pytest.mark.parametrize("offset", [float("nan"), float("inf"), float("-inf")])
+def test_nonfinite_policy_cells_are_rejected(offset):
+    with pytest.raises(ValueError, match="finite"):
+        policy_cell_id("offset", offset)
+
+
+@pytest.mark.parametrize("mode", ["concurrent", "offset"])
+@pytest.mark.parametrize("failure_stage", ["launch", "wait"])
+def test_cpu_worker_failure_cannot_publish_partial_success(mode, failure_stage):
+    failure = RuntimeError("injected collective failure")
+
+    def fail():
+        raise failure
+
+    buffer_a = SimpleNamespace(
+        operation="all_reduce",
+        launch=fail if failure_stage == "launch" else lambda: SimpleNamespace(wait=fail),
+    )
+    buffer_b = SimpleNamespace(operation="all_reduce", launch=lambda: SimpleNamespace(wait=lambda: None))
+    runner = BenchmarkRunner(buffer_a, buffer_b, torch.device("cpu"), validate=False, launch_anchor_lead_us=0)
+    with pytest.raises(RuntimeError, match="CPU collective worker failed") as raised:
+        runner._run_cpu_trial(mode, 0.0, time.perf_counter_ns())
+    assert raised.value.__cause__ is failure
